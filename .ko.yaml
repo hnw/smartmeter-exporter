@@ -1,0 +1,4 @@
+defaultBaseImage: alpine
+defaultLdflags:
+  - -s
+  - -w

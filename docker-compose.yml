@@ -1,0 +1,21 @@
+services:
+  smartmeter-exporter:
+    image: ghcr.io/hnw/smartmeter-exporter:latest
+    container_name: smartmeter-exporter
+    restart: unless-stopped
+
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+
+    ports:
+      - "9102:9102"
+
+    environment:
+      - SMARTMETER_ID=${SMARTMETER_ID}
+      - SMARTMETER_PASSWORD=${SMARTMETER_PASSWORD}
+      - SMARTMETER_CHANNEL=${SMARTMETER_CHANNEL}
+      - SMARTMETER_IPADDR=${SMARTMETER_IPADDR}
+
+#      - SMARTMETER_DEVICE=/dev/ttyACM0
+#      - SMARTMETER_INTERVAL=60
+#      - SMARTMETER_DSE=false
