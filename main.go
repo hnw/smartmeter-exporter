@@ -37,11 +37,30 @@ var (
 		Help: "Unix timestamp of the last successful scrape",
 	})
 
-	// エラー回数カウンター
-	scrapeErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "smartmeter_scrape_errors_total",
-		Help: "Total number of failed scrapes",
+	// 通信時間 (秒)
+	scrapeDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "smartmeter_scrape_duration_seconds",
+		Help:    "Scrape duration in seconds",
+		Buckets: prometheus.DefBuckets,
 	})
+
+	// エラー回数カウンター（種類別）
+	scrapeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "smartmeter_scrape_errors_total",
+		Help: "Total number of failed scrapes, labeled by error type",
+	}, []string{"type"})
+)
+
+const (
+	errorTypeIPResolve = "ip_resolve"
+	errorTypeAuth      = "auth"
+	errorTypeQuery     = "query"
+	errorTypeParse     = "parse"
+)
+
+const (
+	reAuthCooldown   = 5 * time.Second
+	postAuthCooldown = 2 * time.Second
 )
 
 func init() {
@@ -49,6 +68,7 @@ func init() {
 	prometheus.MustRegister(powerGauge)
 	prometheus.MustRegister(currentGauge)
 	prometheus.MustRegister(lastSuccessGauge)
+	prometheus.MustRegister(scrapeDuration)
 	prometheus.MustRegister(scrapeErrors)
 }
 
@@ -112,6 +132,7 @@ func main() {
 		smartmeter.DualStackSK(useDSE),
 		smartmeter.Verbosity(verbosity),
 		smartmeter.Logger(logger),
+		smartmeter.RetryInterval(5 * time.Second),
 	}
 
 	// Channel指定がある場合のみ追加
@@ -193,12 +214,17 @@ func runScrapeLoop(
 
 // 実際のデータ取得ロジック
 func scrape(dev *smartmeter.Device, logger *log.Logger) {
+	start := time.Now()
+	defer func(start time.Time) {
+		scrapeDuration.Observe(time.Since(start).Seconds())
+	}(start)
+
 	// IPアドレス解決 (初回のみ、またはロスト時)
 	if dev.IPAddr == "" {
 		ipAddr, err := dev.GetNeibourIP()
 		if err != nil {
 			logger.Printf("Failed to scan neighbor IP: %v", err)
-			scrapeErrors.Inc()
+			scrapeErrors.WithLabelValues(errorTypeIPResolve).Inc()
 			return
 		}
 		dev.IPAddr = ipAddr
@@ -220,18 +246,25 @@ func scrape(dev *smartmeter.Device, logger *log.Logger) {
 	// クエリ実行
 	response, err := dev.QueryEchonetLite(request, smartmeter.Retry(3))
 	if err != nil {
-		logger.Printf("Query failed, attempting re-auth: %v", err)
+		logger.Printf("Query failed: %v", err)
+		logger.Printf("Waiting %s before attempting re-auth...", reAuthCooldown)
+		time.Sleep(reAuthCooldown)
 		// 失敗時は再認証を試みる
 		if authErr := dev.Authenticate(); authErr != nil {
 			logger.Printf("Authentication failed: %v", authErr)
-			scrapeErrors.Inc()
+			scrapeErrors.WithLabelValues(errorTypeAuth).Inc()
 			return
 		}
+		logger.Printf(
+			"Re-authentication successful. Waiting %s before retrying query...",
+			postAuthCooldown,
+		)
+		time.Sleep(postAuthCooldown)
 		// 再試行
 		response, err = dev.QueryEchonetLite(request, smartmeter.Retry(3))
 		if err != nil {
 			logger.Printf("Query failed after re-auth: %v", err)
-			scrapeErrors.Inc()
+			scrapeErrors.WithLabelValues(errorTypeQuery).Inc()
 			return
 		}
 	}
@@ -262,7 +295,7 @@ func parseAndSetMetrics(response *smartmeter.Frame, logger *log.Logger) {
 		logger.Println("Scrape successful")
 	} else {
 		logger.Println("Response contained no recognized properties")
-		scrapeErrors.Inc()
+		scrapeErrors.WithLabelValues(errorTypeParse).Inc()
 	}
 }
 
