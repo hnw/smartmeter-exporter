@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -112,26 +113,35 @@ func main() {
 
 	flag.Parse()
 
+	logger := newLogger(verbosity)
+	slog.SetDefault(logger)
+	smLogger := slog.NewLogLogger(logger.Handler(), slog.LevelInfo)
+
 	if bRouteID == "" || bRoutePass == "" {
-		log.Fatal("Error: ID and Password are required via flags or env vars.")
+		logger.Error("ID and Password are required via flags or env vars")
+		os.Exit(1)
 	}
 
 	intervalSec, err := strconv.Atoi(intervalStr)
 	if err != nil || intervalSec < 10 {
-		log.Printf("Invalid interval %s, using default 60s", intervalStr)
+		logger.Warn(
+			"Invalid interval, using default",
+			"interval",
+			intervalStr,
+			"default_seconds",
+			60,
+		)
 		intervalSec = 60
 	}
 
 	// --- 3. デバイスの初期化 ---
-	logger := log.New(os.Stderr, "[SmartMeter] ", log.LstdFlags)
-
 	// smartmeter.Open に渡すオプションを動的に構築
 	smOpts := []smartmeter.Option{
 		smartmeter.ID(bRouteID),
 		smartmeter.Password(bRoutePass),
 		smartmeter.DualStackSK(useDSE),
 		smartmeter.Verbosity(verbosity),
-		smartmeter.Logger(logger),
+		smartmeter.Logger(smLogger),
 		smartmeter.RetryInterval(5 * time.Second),
 	}
 
@@ -146,7 +156,8 @@ func main() {
 
 	dev, err := smartmeter.Open(devicePath, smOpts...)
 	if err != nil {
-		log.Fatalf("Failed to open device: %v", err)
+		logger.Error("Failed to open device", "error", err, "device", devicePath)
+		os.Exit(1)
 	}
 
 	// --- 4. バックグラウンド取得ループの開始 ---
@@ -158,8 +169,16 @@ func main() {
 	// --- 5. HTTPサーバー起動 ---
 	http.Handle("/metrics", promhttp.Handler())
 
-	log.Printf("Starting Prometheus exporter on :%s", listenPort)
-	log.Printf("Device: %s, Interval: %ds, DSE: %v", devicePath, intervalSec, useDSE)
+	logger.Info("Starting Prometheus exporter", "port", listenPort)
+	logger.Info(
+		"Device configured",
+		"device",
+		devicePath,
+		"interval_seconds",
+		intervalSec,
+		"dse",
+		useDSE,
+	)
 
 	server := &http.Server{
 		Addr:              ":" + listenPort,
@@ -172,17 +191,18 @@ func main() {
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			logger.Error("HTTP server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-stopChan
-	log.Println("Shutting down...")
+	logger.Info("Shutting down")
 	cancel() // ループを停止
 	ctxShut, cancelShut := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShut()
 	if err := server.Shutdown(ctxShut); err != nil {
-		log.Printf("HTTP server Shutdown: %v", err)
+		logger.Warn("HTTP server shutdown error", "error", err)
 	}
 }
 
@@ -193,13 +213,13 @@ func runScrapeLoop(
 	ctx context.Context,
 	dev *smartmeter.Device,
 	interval time.Duration,
-	logger *log.Logger,
+	logger *slog.Logger,
 ) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// 起動時にまず1回実行
-	logger.Println("First scrape starting...")
+	logger.Info("First scrape starting")
 	scrape(dev, logger)
 
 	for {
@@ -213,7 +233,7 @@ func runScrapeLoop(
 }
 
 // 実際のデータ取得ロジック
-func scrape(dev *smartmeter.Device, logger *log.Logger) {
+func scrape(dev *smartmeter.Device, logger *slog.Logger) {
 	start := time.Now()
 	defer func(start time.Time) {
 		scrapeDuration.Observe(time.Since(start).Seconds())
@@ -223,7 +243,7 @@ func scrape(dev *smartmeter.Device, logger *log.Logger) {
 	if dev.IPAddr == "" {
 		ipAddr, err := dev.GetNeibourIP()
 		if err != nil {
-			logger.Printf("Failed to scan neighbor IP: %v", err)
+			logger.Warn("Failed to scan neighbor IP", "error", err)
 			scrapeErrors.WithLabelValues(errorTypeIPResolve).Inc()
 			return
 		}
@@ -246,24 +266,22 @@ func scrape(dev *smartmeter.Device, logger *log.Logger) {
 	// クエリ実行
 	response, err := dev.QueryEchonetLite(request, smartmeter.Retry(3))
 	if err != nil {
-		logger.Printf("Query failed: %v", err)
-		logger.Printf("Waiting %s before attempting re-auth...", reAuthCooldown)
+		logger.Info("Query failed, attempting re-auth", "error", err)
+		logger.Debug("Waiting before re-auth", "cooldown", reAuthCooldown.String())
 		time.Sleep(reAuthCooldown)
 		// 失敗時は再認証を試みる
 		if authErr := dev.Authenticate(); authErr != nil {
-			logger.Printf("Authentication failed: %v", authErr)
+			logger.Warn("Authentication failed", "error", authErr)
 			scrapeErrors.WithLabelValues(errorTypeAuth).Inc()
 			return
 		}
-		logger.Printf(
-			"Re-authentication successful. Waiting %s before retrying query...",
-			postAuthCooldown,
-		)
+		logger.Info("Re-authentication successful")
+		logger.Debug("Waiting before retrying query", "cooldown", postAuthCooldown.String())
 		time.Sleep(postAuthCooldown)
 		// 再試行
 		response, err = dev.QueryEchonetLite(request, smartmeter.Retry(3))
 		if err != nil {
-			logger.Printf("Query failed after re-auth: %v", err)
+			logger.Warn("Query failed after re-auth", "error", err)
 			scrapeErrors.WithLabelValues(errorTypeQuery).Inc()
 			return
 		}
@@ -273,7 +291,7 @@ func scrape(dev *smartmeter.Device, logger *log.Logger) {
 	parseAndSetMetrics(response, logger)
 }
 
-func parseAndSetMetrics(response *smartmeter.Frame, logger *log.Logger) {
+func parseAndSetMetrics(response *smartmeter.Frame, logger *slog.Logger) {
 	foundData := false
 	for _, p := range response.Properties {
 		switch p.EPC {
@@ -292,9 +310,9 @@ func parseAndSetMetrics(response *smartmeter.Frame, logger *log.Logger) {
 
 	if foundData {
 		lastSuccessGauge.Set(float64(time.Now().Unix()))
-		logger.Println("Scrape successful")
+		logger.Debug("Scrape successful")
 	} else {
-		logger.Println("Response contained no recognized properties")
+		logger.Warn("Response contained no recognized properties")
 		scrapeErrors.WithLabelValues(errorTypeParse).Inc()
 	}
 }
@@ -304,4 +322,46 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+func newLogger(verbosity int) *slog.Logger {
+	level := levelFromVerbosity(verbosity)
+	opts := &slog.HandlerOptions{
+		Level:       level,
+		ReplaceAttr: dropTimeAttr,
+	}
+
+	switch logFormat() {
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	default:
+		return slog.New(slog.NewTextHandler(os.Stdout, opts))
+	}
+}
+
+func levelFromVerbosity(verbosity int) slog.Level {
+	switch {
+	case verbosity <= 0:
+		return slog.LevelError
+	case verbosity == 1:
+		return slog.LevelInfo
+	default:
+		return slog.LevelDebug
+	}
+}
+
+func logFormat() string {
+	if v := strings.ToLower(os.Getenv("SMARTMETER_LOG_FORMAT")); v != "" {
+		if v == "json" || v == "text" {
+			return v
+		}
+	}
+	return "text"
+}
+
+func dropTimeAttr(_ []string, attr slog.Attr) slog.Attr {
+	if attr.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return attr
 }
