@@ -256,10 +256,10 @@ func scrape(dev *smartmeter.Device, logger *slog.Logger) {
 		smartmeter.Get,
 		[]*smartmeter.Property{
 			smartmeter.NewProperty(
-				smartmeter.LvSmartElectricEnergyMeter_InstantaneousElectricPower,
+				smartmeter.LvSmartElectricEnergyMeterInstantaneousElectricPower,
 				nil,
 			),
-			smartmeter.NewProperty(smartmeter.LvSmartElectricEnergyMeter_InstantaneousCurrent, nil),
+			smartmeter.NewProperty(smartmeter.LvSmartElectricEnergyMeterInstantaneousCurrent, nil),
 		},
 	)
 
@@ -295,11 +295,11 @@ func parseAndSetMetrics(response *smartmeter.Frame, logger *slog.Logger) {
 	foundData := false
 	for _, p := range response.Properties {
 		switch p.EPC {
-		case smartmeter.LvSmartElectricEnergyMeter_InstantaneousElectricPower:
+		case smartmeter.LvSmartElectricEnergyMeterInstantaneousElectricPower:
 			val := float64(binary.BigEndian.Uint32(p.EDT))
 			powerGauge.Set(val)
 			foundData = true
-		case smartmeter.LvSmartElectricEnergyMeter_InstantaneousCurrent:
+		case smartmeter.LvSmartElectricEnergyMeterInstantaneousCurrent:
 			r := float64(binary.BigEndian.Uint16(p.EDT[:2])) / 10.0
 			t := float64(binary.BigEndian.Uint16(p.EDT[2:])) / 10.0
 			currentGauge.WithLabelValues("r").Set(r)

@@ -3,7 +3,7 @@ module github.com/hnw/smartmeter-exporter
 go 1.23.0
 
 require (
-	github.com/hnw/go-smartmeter v0.0.0-20200515154420-789ba447f197
+	github.com/hnw/go-smartmeter v0.1.0
 	github.com/prometheus/client_golang v1.23.2
 )
 
